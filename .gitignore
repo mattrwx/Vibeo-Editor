@@ -1,0 +1,20 @@
+# build output
+build/
+out/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+
+# runtime leftovers
+imgui.ini
+*.log
+
+# local ffmpeg drop-ins (users install their own)
+ffmpeg.exe
+ffprobe.exe
+ffmpeg/
