@@ -1,3 +1,8 @@
+`
+⚠️ PERSONAL MESSAGE FROM MATT: I wrote this whole hog with Claude (fable 5), I made this tool out of necessity and only am putting it on GitHub for other people to use it if they have the same needs - quick simply edited videos for completely free. I plan on building on this in the future because it's at a pretty bare bones level right now, and I'll need more features over time and it's like 3 command prompt commands to update it for you guys so I will.
+`
+
+
 # AI Video Editor
 
 **You trim. Your AI writes the edit. FFmpeg renders it. No subscriptions, no API keys.**
