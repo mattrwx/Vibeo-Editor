@@ -9,6 +9,7 @@ struct MediaInfo {
     std::string error;
     double duration = 0;      // seconds; 0 for still images
     int w = 0, h = 0;         // first video stream, if any
+    double fps = 0;           // first video stream frame rate (0 = unknown)
     bool hasVideo = false;
     bool hasAudio = false;
 };
@@ -24,6 +25,9 @@ std::wstring FfprobeExe();
 MediaInfo ProbeMedia(const std::string& path);
 
 // Extract one frame at time t (seconds), scaled to targetW wide, as RGBA.
+// fast=true snaps to the nearest keyframe (-noaccurate_seek -skip_frame nokey):
+// far less decoding per seek, at the cost of frame accuracy.
 // Blocking; call from a worker thread.
 bool ExtractFrameRGBA(const std::string& path, double t, int targetW,
-                      std::vector<uint8_t>& rgba, int& w, int& h, std::string* err);
+                      std::vector<uint8_t>& rgba, int& w, int& h, std::string* err,
+                      bool fast = false);

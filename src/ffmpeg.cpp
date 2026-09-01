@@ -61,7 +61,7 @@ MediaInfo ProbeMedia(const std::string& path) {
     MediaInfo mi;
     ProcResult r = RunProcess({
         FfprobeExe(), L"-v", L"error", L"-of", L"flat",
-        L"-show_entries", L"format=duration:stream=codec_type,width,height",
+        L"-show_entries", L"format=duration:stream=codec_type,width,height,r_frame_rate",
         Utf8ToWide(path),
     });
     if (!r.started) { mi.error = "could not launch ffprobe"; return mi; }
@@ -74,16 +74,22 @@ MediaInfo ProbeMedia(const std::string& path) {
     int curStream = -1;
     std::string curType;
     int curW = 0, curH = 0;
+    double curFps = 0;
     bool gotDims = false;
     auto flushStream = [&]() {
         if (curStream < 0) return;
         if (curType == "video") {
             mi.hasVideo = true;
-            if (!gotDims && curW > 0 && curH > 0) { mi.w = curW; mi.h = curH; gotDims = true; }
+            if (!gotDims && curW > 0 && curH > 0) {
+                mi.w = curW;
+                mi.h = curH;
+                mi.fps = curFps;
+                gotDims = true;
+            }
         } else if (curType == "audio") {
             mi.hasAudio = true;
         }
-        curType.clear(); curW = curH = 0;
+        curType.clear(); curW = curH = 0; curFps = 0;
     };
     while (pos < text.size()) {
         size_t eol = text.find('\n', pos);
@@ -108,6 +114,14 @@ MediaInfo ProbeMedia(const std::string& path) {
             if (field == "codec_type") curType = val;
             else if (field == "width") curW = std::atoi(val.c_str());
             else if (field == "height") curH = std::atoi(val.c_str());
+            else if (field == "r_frame_rate") {
+                // "60/1", "60000/1001", "0/0"
+                double num = std::atof(val.c_str());
+                double den = 1;
+                size_t slash = val.find('/');
+                if (slash != std::string::npos) den = std::atof(val.c_str() + slash + 1);
+                if (num > 0 && den > 0) curFps = num / den;
+            }
         } else if (key == "format.duration") {
             if (val != "N/A") mi.duration = std::atof(val.c_str());
         }
@@ -119,18 +133,24 @@ MediaInfo ProbeMedia(const std::string& path) {
 }
 
 bool ExtractFrameRGBA(const std::string& path, double t, int targetW,
-                      std::vector<uint8_t>& rgba, int& w, int& h, std::string* err) {
+                      std::vector<uint8_t>& rgba, int& w, int& h, std::string* err,
+                      bool fast) {
     if (t < 0) t = 0;
     wchar_t tbuf[64];
     swprintf(tbuf, 64, L"%.3f", t);
     wchar_t sbuf[64];
     swprintf(sbuf, 64, L"scale=%d:-2", targetW);
-    ProcResult r = RunProcess({
-        FfmpegExe(), L"-v", L"error", L"-nostdin",
-        L"-ss", tbuf, L"-i", Utf8ToWide(path),
-        L"-frames:v", L"1", L"-vf", sbuf,
-        L"-f", L"image2pipe", L"-vcodec", L"bmp", L"-",
-    });
+    std::vector<std::wstring> args = { FfmpegExe(), L"-v", L"error", L"-nostdin" };
+    if (fast) {
+        // decode only keyframes and land on the one before t: the seek does
+        // almost no decoding, which is where scrub time actually goes
+        args.insert(args.end(), { L"-noaccurate_seek", L"-skip_frame", L"nokey" });
+    }
+    args.insert(args.end(), { L"-ss", tbuf, L"-i", Utf8ToWide(path),
+                              L"-an", L"-sn", L"-dn",
+                              L"-frames:v", L"1", L"-vf", sbuf,
+                              L"-f", L"image2pipe", L"-vcodec", L"bmp", L"-" });
+    ProcResult r = RunProcess(args);
     if (!r.started) { if (err) *err = "could not launch ffmpeg"; return false; }
     if (r.exitCode != 0 || r.out.empty()) {
         if (err) *err = r.err.empty() ? "no frame produced" : r.err;

@@ -14,10 +14,18 @@ struct TrimSection {
     std::string trans;   // user note about the transition AFTER this section
 };
 
+// A frame-exact moment the user flagged inside a source video.
+struct TrimMarker {
+    double t = 0;        // source-local time
+    std::string note;
+    std::string media;   // optional attached media file name (in media/)
+};
+
 // A source video divided into sections by cut marks (sections cover [0..dur]).
 struct TrimClipV2 {
     std::string path;    // absolute source path (utf8)
     std::vector<TrimSection> secs;
+    std::vector<TrimMarker> markers;
 };
 
 // Flat render segment: one kept span of one source file.
@@ -55,6 +63,7 @@ struct MusicConfig {
     bool loop = true;          // loop if shorter than the video
     bool autobalance = true;   // loudness-normalize the final mix
     double duration = 0;       // probed length (informational)
+    std::vector<double> beats; // user-tapped beat/drop times (seconds into the track)
     bool enabled() const { return !path.empty(); }
 };
 
@@ -66,17 +75,28 @@ std::string FontFileFor(const std::string& name, bool bold);
 bool SaveMusicFile(const Project& p, const MusicConfig& m, std::string* err);
 bool LoadMusicFile(const Project& p, MusicConfig& m);   // false if no .music file
 
-bool SaveTrimFile(const Project& p, const std::vector<TrimClipV2>& clips, std::string* err);
+bool SaveTrimFile(const Project& p, const std::vector<TrimClipV2>& clips,
+                  const std::string& overview, std::string* err);
 // Understands both the v2 section format and the old v1 in/out format.
-bool LoadTrimFile(const Project& p, std::vector<TrimClipV2>& clips, std::string* err);
+bool LoadTrimFile(const Project& p, std::vector<TrimClipV2>& clips,
+                  std::string* overview, std::string* err);
 
 // List files in media\ (top level only). Does not probe.
 std::vector<MediaFile> ScanMediaDir(const Project& p);
 
 // Build the full prompt text. Media entries should already be probed where possible.
 std::string GeneratePrompt(const Project& p, const std::vector<TrimClipV2>& clips,
+                           const std::string& overview,
                            const std::vector<MediaFile>& media, const MusicConfig& music,
-                           int W, int H);
+                           int W, int H, double fps);
+
+// v2 prompt for the AIVE_SCRIPT model: raw sources + markers + ideas; the AI
+// composes the whole video. srcDurations pairs with clips (probed lengths).
+std::string GeneratePromptScript(const Project& p, const std::vector<TrimClipV2>& clips,
+                                 const std::vector<double>& srcDurations,
+                                 const std::string& overview,
+                                 const std::vector<MediaFile>& media,
+                                 const MusicConfig& music, int W, int H, double fps);
 
 bool ReadTextFile(const std::string& path, std::string& out);
 bool WriteTextFile(const std::string& path, const std::string& text, std::string* err);

@@ -30,6 +30,7 @@ int RunProcessStream(const std::vector<std::wstring>& args,
 // ---------------------------------------------------------------- dialogs / shell
 bool OpenVideoFilesDialog(void* hwndOwner, std::vector<std::string>& outPaths);
 bool OpenAudioFileDialog(void* hwndOwner, std::string& outPath);
+bool OpenAnyMediaFilesDialog(void* hwndOwner, std::vector<std::string>& outPaths);
 bool OpenFolderDialog(void* hwndOwner, std::string& outPath);
 void OpenInExplorer(const std::string& path);   // open folder window
 void ShellOpen(const std::string& path);        // open file with default app

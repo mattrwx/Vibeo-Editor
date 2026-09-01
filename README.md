@@ -1,43 +1,42 @@
 # AI Video Editor
 
-**You trim. Your AI writes the edit. FFmpeg renders it. No subscriptions, no API keys.**
+**You mark the moments. Your AI directs the whole edit. FFmpeg renders it.
+No subscriptions, no API keys.**
 
-A fast, folder-based video editor for Windows that outsources the creative editing to
-*any* AI chatbot you already use (ChatGPT, Claude, Gemini, a local model — anything you
-can paste text into). The app packages your footage, media, and instructions into one
-prompt; the AI replies with a tiny `.edit` script; the app renders the final video.
+A fast, folder-based video editor for Windows that hands the *entire* edit to
+any AI chatbot you already use (ChatGPT, Claude, Gemini, a local model). You
+give it raw footage, markers and ideas; it replies with a small **program** in
+the AIVE_SCRIPT language that composes the whole video — timeline, pacing,
+layers, effects — and the app renders it.
 
 ![AI Video Editor](docs/screenshot.png)
 
 ## How it works
 
 ```
-your raw videos ──> [1 Trim] ──> [2 Mark up] ──> [3 Media] ──> [4 Music] ──> [5 Prompt]
-                                                                                 │
-                                                                        copy-paste into your AI
-                                                                                 │
-final .mp4  <────────────────────── [6 Edit + Render]  <───────  AI replies with a .edit file
+raw videos + markers + ideas ──> [1 Mark up] ──> [2 Prompt] ──> your AI writes
+                                                                an AIVE_SCRIPT
+final .mp4  <───────────────────  [3 Edit + Render]  <────────  program
 ```
 
-Everything lives in one project folder you can zip, move, or re-open later — the app
-resumes at whatever step you left off.
+Three steps. Everything lives in one project folder you can zip, move, or
+re-open later.
 
 ## Requirements
 
 - Windows 10/11 with DirectX 11
-- **FFmpeg** (`ffmpeg.exe` + `ffprobe.exe`) — easiest install:
+- **FFmpeg** (`ffmpeg.exe` + `ffprobe.exe`):
 
 ```bash
 winget install Gyan.FFmpeg
 ```
 
-then restart the app (or click **Re-detect**). FFmpeg can also live next to `aive.exe`
-or in an `ffmpeg\bin\` folder beside it.
+then restart the app (or click **Re-detect**).
 
 ## Building from source
 
-Toolchain: CMake + Ninja + clang++ (the MSYS2 `clang64` environment works out of the
-box). Dear ImGui is vendored in `vendor/imgui` — no other dependencies.
+CMake + Ninja + clang++ (MSYS2 `clang64` works out of the box). Dear ImGui is
+vendored in `vendor/imgui`.
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
@@ -46,138 +45,103 @@ cmake --build build
 
 Run `build\aive.exe`.
 
-## Usage
+## The three steps
 
-### 1. Create a project
+### 1. Mark up
 
-Pick a location and a project folder name, or **Open existing project folder** to
-resume one — the app detects which step you were on from the files in the folder.
+Add your raw videos (they become `src: 1`, `src: 2`, ... in the script). For
+each one, scrub the filmstrip timeline and press **M** on every moment that
+matters — kills, punchlines, reveals. Each marker takes an optional note and
+an optional **attached media file** ("use this image here"). Ctrl+scroll zooms
+the timeline; the Scrub dropdown trades preview sharpness for seek speed
+(1/8+ snap to keyframes), and the preview auto-refines to full res when the
+playhead rests.
 
-### 2. Trim
+The **Whole video** panel covers everything global: an overview box (the
+vision — it leads the prompt), global media attachments (watermark, logo,
+ads — copied into `media\`), background music with volume/looping, in-app
+**beat tapping** (play the track, hit Space on the drops), and audio
+auto-balance.
 
-Add one or more raw videos (single track — they play back to back). Cut each video
-into sections and choose what stays:
+### 2. Prompt
 
-| Action | How |
-|---|---|
-| Scrub / preview | click or drag anywhere on the timeline |
-| Add a cut mark | **Cut at playhead** button, or press **C** while hovering the timeline |
-| Move a cut mark | drag the white marker |
-| Remove a cut mark | **Remove cut at playhead** |
-| Keep / remove a section | **right-click** the section (green bar = kept, red = removed) |
-| Frame-accurate nudge | **-1s / -1f / +1f / +1s** buttons |
-| Faster scrubbing | **Scrub res** dropdown (1/1 … 1/16 preview resolution) |
+The app writes `{project}.prompt` — sources with durations/fps, every marker
+with its note and attachments, the media library, music + tapped beats, and
+the full AIVE_SCRIPT language spec — and **copies it to your clipboard**.
+Paste it into your AI.
 
-Reorder or delete whole clips in the list on the left. *Next* saves `{project}.trim`.
+### 3. Edit + Render
 
-### 3. Mark up
+Copy the AI's reply. That's it: the Edit screen detects the `!!!` sentinel on
+your clipboard, pastes and validates automatically — and if you click *Next*
+on the Prompt screen while a valid script is on your clipboard, the render
+**starts immediately**. Errors are line-numbered; paste them back to your AI
+for a fix. The AI can also ask critical `question`s, which the app surfaces
+with answer boxes and a one-click "copy answers back" button.
 
-Every **kept section** gets a note field, and every **transition** between kept
-sections gets one too. This is where you direct the edit — everything you type is
-handed to the AI as instructions:
+## The AIVE_SCRIPT language
 
-> *"intro, me talking — tighten any dead air"*
-> *transition: "add a whoosh and a quick zoom punch"*
-> *"the beach shot — slow motion would be nice, add the title here"*
-
-All fields are optional, but good notes are what make a good edit. Note: **the AI is
-forbidden from adding text/titles unless one of your notes asks for it.**
-
-### 4. Media
-
-The app creates a `media\` folder and opens it in Explorer. Drop in anything the AI
-may use: images/logos (PNG with transparency works best), sound effects, stingers.
-The list refreshes live with image dimensions and sound durations.
-
-### 5. Music
-
-Optionally pick one background track — volume, loop-if-shorter, and an automatic
-fade-out at the end. This screen also has **auto-balance** (loudness normalization of
-the final mix, on by default) so music, effects and the original audio sit together
-without anything blowing out.
-
-### 6. Prompt → AI → Render
-
-- The app generates `{project}.prompt` and **copies it to your clipboard**. It
-  contains your timeline (with your notes), the media inventory, the music info, and
-  the full `.edit` spec with examples.
-- Paste it into your AI of choice. It replies with a `.edit` file.
-- Back in the app: **Paste from clipboard**, **Validate** (clear, line-numbered
-  errors — paste the errors back to your AI if you get any), then **Render**.
-
-The result is `{project}_final.mp4` in the project folder, with a progress bar and
-the full FFmpeg log while it renders.
-
-## The .edit language
-
-What the AI writes — one operation per line, `#` for comments:
+The AI writes a small program: effect definitions, objects, settings, and a
+`timeline` block that *is* the edit.
 
 ```
-AIVE_EDIT v1
-cut from=0 to=1.2
-speed from=45 to=60 rate=2.0
-text "My Epic Day" start=0.8 end=3.5 x=0.5 y=0.18 size=64 color=#FFD700 font=impact bold=1 pop=both
-overlay "logo.png" start=1 end=6 x=0.92 y=0.08 scale=0.10 opacity=0.6 pop=in
-sound "whoosh.wav" at=3.4 volume=0.8
-transition at=12 duration=0.6
-zoom start=8 end=8.4 amount=1.6 mode=in
-flicker start=8 end=8.5 frequency=10 amplitude=0.25
-mute from=10 to=12
-fadein duration=0.5
-fadeout duration=1.0
+!!!
+AIVE_SCRIPT v1
+def shake(amp) {
+  dx: v + rand(0.004*(amp));
+  dy: v + rand(0.004*(amp));
+}
+def killpunch() {
+  zoom: v * (1 + 0.5*spike(ramp(0, 0.6)));
+}
+clip intro  { src:1; from:0;    to:5.2; }
+clip kill1  { src:1; from:11.4; to:16.0; killpunch(); shake(t/3); }
+clip slowmo { src:1; from:16.0; to:18.0; speed:0.5; sat: 1+0.4*smooth(ramp(0,1)); }
+media logo  { path:"logo.png"; during:intro; x:0.9; y:0.1; scale:0.12;
+              corners:0.2; opacity: v*ramp(0,0.4); }
+sound boom  { path:"boom.wav"; during:kill1; at:0.1; volume:0.9; }
+settings    { motionblur: med; fadeout: 1.0; musicstart: 4.0; }
+timeline    { intro; kill1; slowmo; }
 ```
 
-| Op | What it does |
-|---|---|
-| `cut` | remove a span of the timeline |
-| `speed` | speed up / slow down a span (0.25×–4×, pitch preserved) |
-| `overlay` | image on top of the video, optional springy `pop=in\|out\|both` |
-| `text` | styled text — 11 named Windows fonts, bold, color, pop animation |
-| `sound` | mix a sound effect / audio file at a timestamp |
-| `music` | (handled by the app's Music step — the AI is told not to add its own) |
-| `transition` | dip to black/white for a chosen duration |
-| `zoom` | eased zoom: `mode=in` (punch-in), `out`, or `pulse` — window length = speed |
-| `flicker` | brightness oscillation with frequency + amplitude |
-| `mute` | silence the original audio in a span |
-| `fadein` / `fadeout` | fade from/to black at the ends |
+- **clips** select spans of raw source footage (`from`/`to` in source seconds,
+  optional `speed`); the `timeline` block plays them in order — the AI owns
+  the cut entirely.
+- **clip properties** (all animatable by expression): `zoom`, `rot`, `hue`,
+  `sat`, `bright`, `dx`/`dy` (frame shake), `volume`.
+- **media / text / sound objects** layer over the video, timed absolutely or
+  `during:` a clip (clip-local times). Media supports chroma `key`, rounded
+  `corners`, `glow`; declaration order (or `layer:`) sets stacking. Media
+  props: `x y scale rot opacity hue sat bright`; text: `x y opacity`.
+- **`def` effects** are parameterized property assignments; `v` is the
+  property's previous value, so effects compose. Expressions get `t` (object
+  seconds), `f` (frames), `T` (absolute), `dur`, `rand(s)`, `ramp(a,b)`, the
+  easing curves `ease easein easeout backin backout spike smooth`, and a
+  whitelisted math set — everything is validated before render.
+- **settings**: `motionblur` (RSMB-style optical-flow blur), `fadein`/
+  `fadeout`, `musicstart` (anchors the first tapped beat to a chosen moment).
 
-All animations use easing curves (cubic ease for zooms, overshoot springs for pops) —
-only the fades are linear. The full specification, with the BASE-vs-FINAL timeline
-rules and worked examples, is embedded in every generated `.prompt`.
+Everything renders through a staged FFmpeg pipeline at the first source's
+resolution and frame rate (60fps stays 60fps), with silent tracks injected
+for mute clips and the final mix loudness-normalized.
 
 ## Project folder layout
 
 ```
 MyProject\
-  MyProject.trim        your cut marks, keep/remove flags, and notes
-  MyProject.music       background music choice + audio settings
-  media\                images / sounds you provide to the AI
+  MyProject.trim        sources + markers (notes, attachments) + overview
+  MyProject.music       music choice, beats, audio settings
+  media\                attached / dropped media files
   MyProject.prompt      what you paste into the AI
-  MyProject.edit        what the AI gave back (saved on Validate/Render)
+  MyProject.edit        the AI's script (saved on validate/render)
   MyProject_final.mp4   the rendered result
-  temp\                 intermediate files (auto-deleted on success)
+  temp\                 intermediates (auto-deleted; AIVE_KEEP_TEMP=1 keeps them)
 ```
-
-Everything is plain text — you can hand-edit any of it.
-
-## Tips
-
-- **The notes are the steering wheel.** The AI only knows what your section and
-  transition notes tell it. "boring part, speed through it" beats silence.
-- Mixed resolutions and frame rates are fine — everything is normalized to the first
-  clip's resolution at 30 fps. Clips without audio get a silent track automatically.
-- You can iterate: tweak the `.edit` by hand (or ask the AI for changes), Validate,
-  and Render again.
-- Renders that use `zoom` take roughly twice as long — the whole video goes through
-  a high-resolution zoom pass for smoothness.
 
 ## Troubleshooting
 
-- **"FFmpeg not found" banner** — install FFmpeg (see Requirements), then restart or
-  click Re-detect.
-- **Validation errors** — they're line-numbered and specific (unknown media file,
-  overlapping cuts, out-of-range time…). Paste them back to your AI and ask it to fix
-  the `.edit`.
-- **Render failed** — open the **FFmpeg log** section on the render screen for the
-  exact command and error. Set the environment variable `AIVE_KEEP_TEMP=1` to keep
-  the `temp\` intermediates for inspection.
+- **"FFmpeg not found"** — install it (see Requirements), restart or Re-detect.
+- **Validation errors** — line-numbered and specific; paste them back to your
+  AI and ask for a corrected script.
+- **Render failed** — open the **FFmpeg log** on the render screen; set
+  `AIVE_KEEP_TEMP=1` to keep intermediates for inspection.

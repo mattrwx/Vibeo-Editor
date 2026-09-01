@@ -13,7 +13,9 @@ add_executable(aive WIN32
     src/texture.cpp
     src/ffmpeg.cpp
     src/project.cpp
+    src/prompt.cpp
     src/edit.cpp
+    src/script.cpp
     src/render.cpp
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -25,7 +27,7 @@ add_executable(aive WIN32
 
 target_include_directories(aive PRIVATE src ${IMGUI_DIR})
 target_compile_definitions(aive PRIVATE UNICODE _UNICODE NOMINMAX)
-target_link_libraries(aive PRIVATE d3d11 dxgi d3dcompiler dwmapi ole32 uuid shell32 user32 gdi32 shlwapi)
+target_link_libraries(aive PRIVATE d3d11 dxgi d3dcompiler dwmapi ole32 uuid shell32 user32 gdi32 shlwapi winmm)
 
 if(MINGW)
     # static-link the runtime so the exe runs without MSYS2 DLLs on PATH

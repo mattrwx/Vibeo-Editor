@@ -204,6 +204,48 @@ bool OpenVideoFilesDialog(void* hwndOwner, std::vector<std::string>& outPaths) {
     return ok;
 }
 
+bool OpenAnyMediaFilesDialog(void* hwndOwner, std::vector<std::string>& outPaths) {
+    outPaths.clear();
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dlg))))
+        return false;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    COMDLG_FILTERSPEC filters[] = {
+        { L"Media files",
+          L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.mp3;*.wav;*.ogg;*.flac;*.m4a;*.aac;"
+          L"*.mp4;*.mov;*.mkv;*.avi;*.webm" },
+        { L"All files", L"*.*" },
+    };
+    dlg->SetFileTypes(2, filters);
+    dlg->SetTitle(L"Attach media");
+    bool ok = false;
+    if (SUCCEEDED(dlg->Show((HWND)hwndOwner))) {
+        IShellItemArray* items = nullptr;
+        if (SUCCEEDED(dlg->GetResults(&items))) {
+            DWORD count = 0;
+            items->GetCount(&count);
+            for (DWORD i = 0; i < count; i++) {
+                IShellItem* it = nullptr;
+                if (SUCCEEDED(items->GetItemAt(i, &it))) {
+                    PWSTR psz = nullptr;
+                    if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &psz))) {
+                        outPaths.push_back(WideToUtf8(psz));
+                        CoTaskMemFree(psz);
+                    }
+                    it->Release();
+                }
+            }
+            items->Release();
+            ok = !outPaths.empty();
+        }
+    }
+    dlg->Release();
+    return ok;
+}
+
 bool OpenAudioFileDialog(void* hwndOwner, std::string& outPath) {
     IFileOpenDialog* dlg = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,

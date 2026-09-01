@@ -3,10 +3,13 @@
 #include "ffmpeg.h"
 #include "project.h"
 #include "edit.h"
+#include "script.h"
 #include "render.h"
 #include "texture.h"
 
 #include "imgui.h"
+
+#include <mmsystem.h>   // MCI: in-app music playback for beat tapping
 
 #include <algorithm>
 #include <atomic>
@@ -37,7 +40,6 @@ constexpr ImVec4 TextDim{ 0.50f, 0.55f, 0.45f, 1.f };
 constexpr ImVec4 Bad{ 1.f, 0.42f, 0.36f, 1.f };
 constexpr ImVec4 Warn{ 0.95f, 0.82f, 0.40f, 1.f };
 constexpr ImU32 TlLime = IM_COL32(168, 255, 0, 255);
-constexpr ImU32 TlRed = IM_COL32(215, 72, 56, 255);
 constexpr ImU32 TlMark = IM_COL32(245, 245, 240, 255);
 constexpr ImU32 TlPlayhead = IM_COL32(255, 82, 70, 255);
 } // namespace theme
@@ -111,14 +113,14 @@ static void ApplyTheme(float dpi) {
 }
 
 // ---------------------------------------------------------------- state
-enum class Screen { Project, Trim, MarkUp, Media, Music, Prompt, Edit };
+enum class Screen { Project, MarkUp, Prompt, Edit };
 
 struct Clip {
     uint64_t id = 0;
     std::string path;        // absolute source path
     std::string fileName;
     double playhead = 0;
-    std::vector<TrimSection> secs;   // cut-mark sections covering [0..duration]
+    std::vector<TrimMarker> markers;
     bool probed = false;
     std::string err;
     MediaInfo info;
@@ -140,26 +142,32 @@ struct AppState {
     Project proj;
     bool hasProject = false;
 
-    // trim screen
+    // markup screen
     std::vector<Clip> clips;
+    std::string overview;
     int sel = -1;
-    int dragMode = 0;              // 0 none, 3 playhead, 100+i = dragging cut mark i
+    int dragMode = 0;              // 0 none, 3 playhead, 5 scrollbar, 1000+i marker
     TexPtr preview;
     uint64_t previewClipId = 0;
     double lastReqT = -1;
     std::string trimMsg;
-
-    // trim scrub quality: preview is extracted at sourceWidth / scrubDiv
     int scrubDiv = 2;
+    double lastReqWall = 0;
+    bool hiResDone = true;
+    float tlZoom = 1.f;
+    float tlScroll = 0.f;
 
-    // media screen
+    // media library
     std::vector<MediaFile> media;
     double lastScanT = 0;
 
-    // music screen
+    // music (lives on the markup screen now)
     MusicConfig music;
-    bool musicProbed = true;   // false while the chosen file is being probed
+    bool musicProbed = true;
     std::string musicMsg;
+    bool tapping = false;
+    bool tapPreparing = false;
+    std::vector<double> tapTimes;
 
     // prompt screen
     std::string promptText;
@@ -169,17 +177,59 @@ struct AppState {
     std::string editText;
     EditScript script;
     bool validated = false;
+    std::vector<std::string> qAnswers;
+    double lastClipCheck = 0;
+    std::string lastAutoPasted;
+    std::string editMsg;
     RenderState render;
 };
 static AppState g;
 static uint64_t g_nextClipId = 1;
+
+// ---------------------------------------------------------------- MCI playback
+static bool g_mciOpen = false;
+static void MciStop() {
+    if (g_mciOpen) {
+        mciSendStringW(L"close aivebeat", nullptr, 0, nullptr);
+        g_mciOpen = false;
+    }
+}
+static bool MciTryOpenAndPlay(const std::wstring& openCmd) {
+    if (mciSendStringW(openCmd.c_str(), nullptr, 0, nullptr) != 0) return false;
+    g_mciOpen = true;
+    mciSendStringW(L"set aivebeat time format milliseconds", nullptr, 0, nullptr);
+    if (mciSendStringW(L"play aivebeat", nullptr, 0, nullptr) != 0) {
+        MciStop();
+        return false;
+    }
+    return true;
+}
+static bool MciStart(const std::string& path) {
+    MciStop();
+    std::wstring w = Utf8ToWide(path);
+    if (MciTryOpenAndPlay(L"open \"" + w + L"\" alias aivebeat")) return true;
+    if (MciTryOpenAndPlay(L"open \"" + w + L"\" type mpegvideo alias aivebeat")) return true;
+    return false;
+}
+static double MciPosSec() {
+    if (!g_mciOpen) return -1;
+    wchar_t buf[64]{};
+    if (mciSendStringW(L"status aivebeat position", buf, 64, nullptr) != 0) return -1;
+    return _wtof(buf) / 1000.0;
+}
+static bool MciPlaying() {
+    if (!g_mciOpen) return false;
+    wchar_t buf[64]{};
+    if (mciSendStringW(L"status aivebeat mode", buf, 64, nullptr) != 0) return false;
+    return wcscmp(buf, L"playing") == 0;
+}
 
 // ---------------------------------------------------------------- preview worker
 namespace {
 std::mutex pvM;
 std::condition_variable pvCv;
 bool pvHasReq = false, pvStop = false, pvStarted = false;
-struct { uint64_t clipId; std::string path; double t; int width; } pvReq;
+struct { uint64_t clipId; std::string path; double t; int width; bool fast; } pvReq;
 std::thread pvThread;
 
 Clip* FindClip(uint64_t id) {
@@ -201,7 +251,7 @@ void PreviewThreadMain() {
         std::vector<uint8_t> rgba;
         int w = 0, h = 0;
         std::string err;
-        if (ExtractFrameRGBA(req.path, req.t, req.width, rgba, w, h, &err)) {
+        if (ExtractFrameRGBA(req.path, req.t, req.width, rgba, w, h, &err, req.fast)) {
             uint64_t id = req.clipId;
             PostToMainThread([id, rgba = std::move(rgba), w, h]() {
                 if (g.sel >= 0 && g.sel < (int)g.clips.size() && g.clips[g.sel].id == id) {
@@ -213,119 +263,75 @@ void PreviewThreadMain() {
     }
 }
 
-void RequestPreview(const Clip& c, double t) {
+void RequestPreview(const Clip& c, double t, bool forceFull = false) {
     int srcW = c.info.w > 0 ? c.info.w : 1920;
-    int w = std::clamp(srcW / std::max(1, g.scrubDiv), 64, 3840);
+    int w, fast;
+    if (forceFull) {
+        w = std::clamp(srcW, 64, 3840);
+        fast = false;
+    } else {
+        w = std::clamp(srcW / std::max(1, g.scrubDiv), 64, 3840);
+        fast = g.scrubDiv >= 8;
+    }
+    g.lastReqWall = NowSeconds();
+    g.hiResDone = forceFull || g.scrubDiv == 1;
     {
         std::lock_guard<std::mutex> lk(pvM);
         if (!pvStarted) { pvStarted = true; pvThread = std::thread(PreviewThreadMain); }
-        pvReq = { c.id, c.path, t, w };
+        pvReq = { c.id, c.path, t, w, fast != 0 };
         pvHasReq = true;
     }
     pvCv.notify_one();
 }
 } // namespace
 
-// ---------------------------------------------------------------- section model
-// Make secs a sorted, contiguous cover of [0..duration].
-static void NormalizeSections(Clip& c) {
-    double dur = c.info.duration;
-    if (dur <= 0) { c.secs = { TrimSection{ 0, 0, true } }; return; }
-    std::vector<TrimSection> in;
-    for (auto s : c.secs) {
-        s.a = std::clamp(s.a, 0.0, dur);
-        s.b = std::clamp(s.b, 0.0, dur);
-        if (s.b - s.a > 0.02) in.push_back(std::move(s));
-    }
-    std::sort(in.begin(), in.end(),
-              [](const TrimSection& x, const TrimSection& y) { return x.a < y.a; });
-    std::vector<TrimSection> out;
-    double cur = 0;
-    for (auto& s : in) {
-        if (s.a - cur > 0.05) out.push_back(TrimSection{ cur, s.a, false });
-        if (s.a < cur) s.a = cur;
-        if (s.b - s.a > 0.02) { out.push_back(s); cur = out.back().b; }
-    }
-    if (dur - cur > 0.05) out.push_back(TrimSection{ cur, dur, false });
-    if (out.empty()) out.push_back(TrimSection{ 0, dur, true });
-    out.front().a = 0;
-    out.back().b = dur;
-    for (size_t i = 1; i < out.size(); i++) out[i].a = out[i - 1].b;
-    c.secs = std::move(out);
+// ---------------------------------------------------------------- helpers
+static void AddMarkerAt(Clip& c, double t) {
+    TrimMarker m;
+    m.t = t;
+    auto it = std::lower_bound(c.markers.begin(), c.markers.end(), t,
+                               [](const TrimMarker& a, double v) { return a.t < v; });
+    c.markers.insert(it, m);
 }
 
-static void AddCutMark(Clip& c, double t) {
-    for (size_t i = 0; i < c.secs.size(); i++) {
-        TrimSection& s = c.secs[i];
-        if (t > s.a + 0.05 && t < s.b - 0.05) {
-            TrimSection right = s;      // inherits keep flag + transition note
-            right.a = t;
-            right.note.clear();
-            s.b = t;
-            s.trans.clear();            // the transition after now belongs to the right half
-            c.secs.insert(c.secs.begin() + i + 1, std::move(right));
-            return;
-        }
-    }
-}
-
-static void RemoveCutNear(Clip& c, double t) {
-    int best = -1;
-    double bd = 0.5;   // seconds of tolerance
-    for (size_t i = 0; i + 1 < c.secs.size(); i++) {
-        double d = std::abs(c.secs[i].b - t);
-        if (d < bd) { bd = d; best = (int)i; }
-    }
-    if (best < 0) return;
-    TrimSection& L = c.secs[best];
-    TrimSection& R = c.secs[best + 1];
-    L.b = R.b;
-    L.keep = L.keep || R.keep;
-    if (L.note.empty()) L.note = R.note;
-    L.trans = R.trans;
-    c.secs.erase(c.secs.begin() + best + 1);
-}
-
-static TrimSection* SectionAt(Clip& c, double t) {
-    for (auto& s : c.secs)
-        if (t >= s.a && t <= s.b) return &s;
-    return c.secs.empty() ? nullptr : &c.secs.back();
-}
-
-static double ClipKeptDuration(const Clip& c) {
+static double TotalSourceDuration() {
     double t = 0;
-    for (const auto& s : c.secs)
-        if (s.keep) t += s.b - s.a;
-    return t;
-}
-
-static double TotalTrimmedDuration() {
-    double t = 0;
-    for (const auto& c : g.clips) t += ClipKeptDuration(c);
-    return t;
-}
-
-static std::vector<TrimClip> FlatKeptSegments() {
-    std::vector<TrimClip> v;
     for (const auto& c : g.clips)
-        for (const auto& s : c.secs)
-            if (s.keep) v.push_back({ c.path, s.a, s.b });
-    return v;
+        if (c.probed) t += c.info.duration;
+    return t;
 }
 
 static std::vector<TrimClipV2> ToTrimV2() {
     std::vector<TrimClipV2> v;
-    for (const auto& c : g.clips) v.push_back({ c.path, c.secs });
+    for (const auto& c : g.clips) {
+        TrimClipV2 t;
+        t.path = c.path;
+        t.markers = c.markers;
+        v.push_back(std::move(t));
+    }
     return v;
 }
 
 static void SaveTrimNow() {
     if (!g.hasProject || g.clips.empty()) return;
     std::string err;
-    if (!SaveTrimFile(g.proj, ToTrimV2(), &err)) g.trimMsg = err;
+    if (!SaveTrimFile(g.proj, ToTrimV2(), g.overview, &err)) g.trimMsg = err;
 }
 
-// ---------------------------------------------------------------- async helpers
+static std::vector<ScriptSource> Sources() {
+    std::vector<ScriptSource> v;
+    for (const auto& c : g.clips)
+        v.push_back({ c.path, c.probed ? c.info.duration : 0 });
+    return v;
+}
+
+static double ProjectFps() {
+    if (!g.clips.empty() && g.clips[0].probed && g.clips[0].info.fps > 0)
+        return g.clips[0].info.fps;
+    return 30;
+}
+
+// ---------------------------------------------------------------- async
 static const int kStripCount = 14;
 
 static void StartFilmstrip(Clip& c) {
@@ -340,7 +346,7 @@ static void StartFilmstrip(Clip& c) {
             std::vector<uint8_t> rgba;
             int w = 0, h = 0;
             std::string err;
-            if (ExtractFrameRGBA(path, t, 160, rgba, w, h, &err)) {
+            if (ExtractFrameRGBA(path, t, 160, rgba, w, h, &err, true)) {
                 PostToMainThread([id, i, rgba = std::move(rgba), w, h]() {
                     Clip* c = FindClip(id);
                     if (c && i < (int)c->strip.size())
@@ -364,9 +370,9 @@ static void StartProbeClip(Clip& c) {
             if (!mi.ok) c->err = mi.error.empty() ? "cannot read file" : mi.error;
             else if (!mi.hasVideo) c->err = "no video stream in this file";
             else {
-                NormalizeSections(*c);
-                for (const auto& s : c->secs)
-                    if (s.keep) { c->playhead = s.a; break; }
+                for (auto& mk : c->markers)
+                    mk.t = std::clamp(mk.t, 0.0, mi.duration);
+                c->playhead = 0;
                 StartFilmstrip(*c);
                 if (g.sel >= 0 && g.sel < (int)g.clips.size() && g.clips[g.sel].id == c->id)
                     RequestPreview(*c, c->playhead);
@@ -420,6 +426,20 @@ static void RescanMedia(bool force) {
     g.media = std::move(merged);
 }
 
+// copy a picked file into media\ and return its file name ("" on failure)
+static std::string ImportIntoMedia(const std::string& srcPath) {
+    std::error_code ec;
+    fs::create_directories(fs::path(Utf8ToWide(g.proj.MediaDir())), ec);
+    size_t slash = srcPath.find_last_of("\\/");
+    std::string name = slash == std::string::npos ? srcPath : srcPath.substr(slash + 1);
+    fs::copy_file(fs::path(Utf8ToWide(srcPath)),
+                  fs::path(Utf8ToWide(g.proj.MediaDir() + "\\" + name)),
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) return "";
+    RescanMedia(true);
+    return name;
+}
+
 static void StartDetectFfmpeg() {
     if (g.detecting) return;
     g.detecting = true;
@@ -434,7 +454,57 @@ static void StartDetectFfmpeg() {
     });
 }
 
-// ---------------------------------------------------------------- small UI helpers
+static void StartTapping() {
+    if (MciStart(g.music.path)) {
+        g.tapping = true;
+        g.tapTimes.clear();
+        return;
+    }
+    g.tapPreparing = true;
+    g.musicMsg.clear();
+    std::string src = g.music.path;
+    JobsPush([src]() {
+        wchar_t tmp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, tmp);
+        std::string wav = WideToUtf8(tmp) + "aive_beat.wav";
+        ProcResult r = RunProcess({ FfmpegExe(), L"-y", L"-nostdin", L"-v", L"error",
+                                    L"-i", Utf8ToWide(src),
+                                    L"-vn", L"-ac", L"2", L"-ar", L"44100",
+                                    L"-c:a", L"pcm_s16le", Utf8ToWide(wav) });
+        bool ok = r.started && r.exitCode == 0;
+        PostToMainThread([ok, wav]() {
+            g.tapPreparing = false;
+            if (ok && MciStart(wav)) {
+                g.tapping = true;
+                g.tapTimes.clear();
+            } else {
+                g.musicMsg = "Could not play or convert this audio file for tapping.";
+            }
+        });
+    });
+}
+
+static void StartProbeMusic() {
+    g.musicProbed = false;
+    g.musicMsg.clear();
+    std::string path = g.music.path;
+    JobsPush([path]() {
+        MediaInfo mi = ProbeMedia(path);
+        PostToMainThread([path, mi]() {
+            if (g.music.path != path) return;
+            g.musicProbed = true;
+            if (!mi.ok || !mi.hasAudio) {
+                g.musicMsg = "This file has no usable audio: " +
+                             (mi.error.empty() ? path : mi.error);
+                g.music.path.clear();
+            } else {
+                g.music.duration = mi.duration;
+            }
+        });
+    });
+}
+
+// ---------------------------------------------------------------- UI helpers
 static int InputTextResizeCb(ImGuiInputTextCallbackData* d) {
     if (d->EventFlag == ImGuiInputTextFlags_CallbackResize) {
         auto* s = (std::string*)d->UserData;
@@ -452,15 +522,6 @@ static bool InputTextMultilineStr(const char* label, std::string& s, ImVec2 size
 static bool InputTextStrHint(const char* label, const char* hint, std::string& s) {
     return ImGui::InputTextWithHint(label, hint, (char*)s.c_str(), s.capacity() + 1,
                                     ImGuiInputTextFlags_CallbackResize, InputTextResizeCb, &s);
-}
-
-static bool AllClipsReady(std::string* why) {
-    if (g.clips.empty()) { if (why) *why = "add at least one video"; return false; }
-    for (const auto& c : g.clips) {
-        if (!c.probed) { if (why) *why = "still reading video info..."; return false; }
-        if (!c.err.empty()) { if (why) *why = "remove clips marked red first"; return false; }
-    }
-    return true;
 }
 
 static void FfmpegBanner() {
@@ -502,12 +563,57 @@ static bool BottomBar(const char* primaryLabel, bool enabled, const char* disabl
     return clicked && enabled;
 }
 
-// ---------------------------------------------------------------- project open / prompt
-static void StartProbeMusic();
-
-static void EnterEditScreenLoadingMedia() {
+// ---------------------------------------------------------------- validate / render
+static void ValidateEditNow() {
     RescanMedia(true);
-    g.screen = Screen::Edit;
+    g.script = ParseScript(g.editText, Sources(), g.media, &g.music, ProjectFps());
+    g.validated = true;
+    g.qAnswers.assign(g.script.questions.size(), std::string());
+    std::string err;
+    WriteTextFile(g.proj.EditFilePath(), g.editText, &err);
+}
+
+static void StartRenderNow() {
+    std::string err;
+    WriteTextFile(g.proj.EditFilePath(), g.editText, &err);
+    StartRender(g.render, g.proj, Sources(), g.script, g.media, g.music);
+}
+
+static bool LooksLikeEditReply(const std::string& s) {
+    size_t i = 0;
+    for (int guard = 0; guard < 6 && i < s.size(); guard++) {
+        size_t eol = s.find('\n', i);
+        std::string line = s.substr(i, eol == std::string::npos ? std::string::npos : eol - i);
+        size_t ws = line.find_first_not_of(" \t\r");
+        if (ws != std::string::npos) {
+            std::string t = line.substr(ws);
+            if (t.rfind("```", 0) != 0)
+                return t.rfind("!!!", 0) == 0;
+        }
+        if (eol == std::string::npos) break;
+        i = eol + 1;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- project open / prompt
+static void GeneratePromptNow() {
+    RescanMedia(true);
+    int W = 0, H = 0;
+    if (!g.clips.empty() && g.clips[0].probed) {
+        W = g.clips[0].info.w;
+        H = g.clips[0].info.h;
+    }
+    std::vector<double> durs;
+    for (const auto& c : g.clips) durs.push_back(c.probed ? c.info.duration : 0);
+    g.promptText = GeneratePromptScript(g.proj, ToTrimV2(), durs, g.overview, g.media,
+                                        g.music, W, H, ProjectFps());
+    std::string err;
+    WriteTextFile(g.proj.PromptFilePath(), g.promptText, &err);
+    ImGui::SetClipboardText(g.promptText.c_str());
+    g.promptMsg = err.empty()
+        ? "Prompt generated, saved and COPIED TO YOUR CLIPBOARD. Paste it into your AI of choice."
+        : ("Prompt copied to clipboard, but saving failed: " + err);
 }
 
 static void OpenExistingProject(const std::string& dir) {
@@ -522,6 +628,7 @@ static void OpenExistingProject(const std::string& dir) {
     g.promptText.clear();
     g.editText.clear();
     g.validated = false;
+    g.overview.clear();
     g.music = MusicConfig{};
     g.musicProbed = true;
     g.musicMsg.clear();
@@ -530,41 +637,28 @@ static void OpenExistingProject(const std::string& dir) {
     std::error_code ec;
     std::string err;
     std::vector<TrimClipV2> tc;
-    if (LoadTrimFile(g.proj, tc, &err)) {
+    if (LoadTrimFile(g.proj, tc, &g.overview, &err)) {
         for (const auto& t : tc) {
             AddClipPath(t.path);
-            g.clips.back().secs = t.secs;
+            g.clips.back().markers = t.markers;
         }
     }
-    bool hasTrim = fs::exists(fs::path(Utf8ToWide(g.proj.TrimFilePath())), ec);
+    fs::create_directories(fs::path(Utf8ToWide(g.proj.MediaDir())), ec);
+    RescanMedia(true);
     bool hasPrompt = fs::exists(fs::path(Utf8ToWide(g.proj.PromptFilePath())), ec);
     bool hasEdit = fs::exists(fs::path(Utf8ToWide(g.proj.EditFilePath())), ec);
     if (hasEdit || hasPrompt) {
         ReadTextFile(g.proj.PromptFilePath(), g.promptText);
-        if (hasEdit) ReadTextFile(g.proj.EditFilePath(), g.editText);
-        EnterEditScreenLoadingMedia();
-        if (!hasEdit) g.screen = Screen::Prompt;
+        if (hasEdit) {
+            ReadTextFile(g.proj.EditFilePath(), g.editText);
+            g.screen = Screen::Edit;
+        } else {
+            g.screen = Screen::Prompt;
+        }
         g.promptMsg = "Loaded existing prompt file.";
-    } else if (hasTrim) {
-        fs::create_directories(fs::path(Utf8ToWide(g.proj.MediaDir())), ec);
-        RescanMedia(true);
-        g.screen = Screen::MarkUp;
     } else {
-        g.screen = Screen::Trim;
+        g.screen = Screen::MarkUp;
     }
-}
-
-static void GeneratePromptNow() {
-    RescanMedia(true);
-    int W = 0, H = 0;
-    if (!g.clips.empty() && g.clips[0].probed) { W = g.clips[0].info.w; H = g.clips[0].info.h; }
-    g.promptText = GeneratePrompt(g.proj, ToTrimV2(), g.media, g.music, W, H);
-    std::string err;
-    WriteTextFile(g.proj.PromptFilePath(), g.promptText, &err);
-    ImGui::SetClipboardText(g.promptText.c_str());
-    g.promptMsg = err.empty()
-        ? "Prompt generated, saved and COPIED TO YOUR CLIPBOARD. Paste it into your AI of choice."
-        : ("Prompt copied to clipboard, but saving failed: " + err);
 }
 
 // ---------------------------------------------------------------- screens
@@ -573,7 +667,7 @@ static void ScreenProject() {
     ImGui::PushFont(nullptr, 40.f * g.dpi);
     ImGui::TextColored(theme::Lime, "AI VIDEO EDITOR");
     ImGui::PopFont();
-    ImGui::TextDisabled("trim it yourself  -  let an AI write the edit  -  render with one click");
+    ImGui::TextDisabled("mark it up  -  let an AI direct the edit  -  render with one click");
     ImGui::Spacing();
     ImGui::Spacing();
     FfmpegBanner();
@@ -609,7 +703,7 @@ static void ScreenProject() {
         } else {
             std::string dir = std::string(g.baseDir) + "\\" + clean;
             std::error_code ec;
-            fs::create_directories(fs::path(Utf8ToWide(dir)), ec);
+            fs::create_directories(fs::path(Utf8ToWide(dir + "\\media")), ec);
             if (ec) {
                 g.projMsg = "Could not create folder: " + dir;
             } else {
@@ -623,8 +717,11 @@ static void ScreenProject() {
                 g.promptText.clear();
                 g.editText.clear();
                 g.validated = false;
+                g.overview.clear();
+                g.music = MusicConfig{};
+                g.musicProbed = true;
                 g.projMsg.clear();
-                g.screen = Screen::Trim;
+                g.screen = Screen::MarkUp;
             }
         }
     }
@@ -640,8 +737,7 @@ static void ScreenProject() {
     }
 }
 
-// Timeline with cut marks: sections tinted by keep/remove, draggable yellow
-// marks, right-click toggles a section, drag elsewhere scrubs.
+// Marker timeline: scrub, zoom, drop lime marker flags. No trimming.
 static void TimelineUI(Clip& c) {
     double dur = c.info.duration;
     if (dur <= 0) {
@@ -654,44 +750,57 @@ static void TimelineUI(Clip& c) {
     ImVec2 sz(std::max(avail.x, 60.f), tlH);
     ImGui::InvisibleButton("##timeline", sz);
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    auto X = [&](double t) { return p0.x + (float)(t / dur) * sz.x; };
-    auto T = [&](float x) { return std::clamp((double)(x - p0.x) / sz.x * dur, 0.0, dur); };
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 mp = io.MousePos;
 
+    float contentW = std::max(sz.x * g.tlZoom, sz.x);
+    g.tlScroll = std::clamp(g.tlScroll, 0.f, std::max(0.f, contentW - sz.x));
+    auto X = [&](double t) { return p0.x + (float)(t / dur) * contentW - g.tlScroll; };
+    auto T = [&](float sx) {
+        return std::clamp((double)(sx - p0.x + g.tlScroll) / contentW * dur, 0.0, dur);
+    };
+
+    float sbH = (g.tlZoom > 1.001f) ? 6.f * g.dpi : 0.f;
+    float y0 = p0.y + 3, y1 = p0.y + sz.y - 18.f * g.dpi - sbH;
     dl->AddRectFilled(p0, ImVec2(p0.x + sz.x, p0.y + sz.y), IM_COL32(14, 15, 13, 255), 4);
-    float barH = 5.f * g.dpi;
-    float y0 = p0.y + barH + 2, y1 = p0.y + sz.y - 18.f * g.dpi;
     int n = (int)c.strip.size();
     if (n > 0) {
-        float tw = sz.x / n;
+        dl->PushClipRect(ImVec2(p0.x, y0), ImVec2(p0.x + sz.x, y1), true);
+        float tw = contentW / n;
         for (int i = 0; i < n; i++) {
             if (!c.strip[i]) continue;
-            dl->AddImage((ImTextureID)c.strip[i]->ImId(),
-                         ImVec2(p0.x + i * tw, y0), ImVec2(p0.x + (i + 1) * tw, y1));
+            float xa = p0.x + i * tw - g.tlScroll;
+            float xb = xa + tw;
+            if (xb < p0.x || xa > p0.x + sz.x) continue;
+            dl->AddImage((ImTextureID)c.strip[i]->ImId(), ImVec2(xa, y0), ImVec2(xb, y1));
         }
+        dl->PopClipRect();
     }
-    // section tint + keep/remove color bar on top
-    for (const auto& s : c.secs) {
-        float x0 = X(s.a), x1 = X(s.b);
-        if (s.keep) {
-            dl->AddRectFilled(ImVec2(x0, p0.y), ImVec2(x1, p0.y + barH), theme::TlLime);
-        } else {
-            dl->AddRectFilled(ImVec2(x0, p0.y), ImVec2(x1, p0.y + barH), theme::TlRed);
-            dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(5, 6, 4, 190));
-        }
-    }
-    // cut marks (boundaries between sections)
-    for (size_t i = 0; i + 1 < c.secs.size(); i++) {
-        float x = X(c.secs[i].b);
-        dl->AddRectFilled(ImVec2(x - 1.5f, p0.y), ImVec2(x + 1.5f, y1), theme::TlMark);
-        dl->AddTriangleFilled(ImVec2(x - 6.f * g.dpi, p0.y), ImVec2(x + 6.f * g.dpi, p0.y),
-                              ImVec2(x, p0.y + 9.f * g.dpi), theme::TlMark);
+    // markers
+    for (const auto& mk : c.markers) {
+        float x = X(mk.t);
+        if (x < p0.x || x > p0.x + sz.x) continue;
+        dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), theme::TlLime, 1.6f);
+        float d = 5.f * g.dpi;
+        dl->AddQuadFilled(ImVec2(x, y0), ImVec2(x + d, y0 + d), ImVec2(x, y0 + 2 * d),
+                          ImVec2(x - d, y0 + d), theme::TlLime);
+        if (ImGui::IsItemHovered() && std::abs(mp.x - x) < 6.f * g.dpi)
+            ImGui::SetTooltip("marker @ %s%s%s - drag to move, right-click to delete",
+                              FormatTime(mk.t).c_str(), mk.note.empty() ? "" : "\n",
+                              mk.note.c_str());
     }
     // playhead
     float px = X(c.playhead);
-    dl->AddRectFilled(ImVec2(px - 1.5f, p0.y), ImVec2(px + 1.5f, p0.y + sz.y), theme::TlPlayhead);
+    dl->AddRectFilled(ImVec2(px - 1.5f, p0.y), ImVec2(px + 1.5f, y1 + 2), theme::TlPlayhead);
+    // scrollbar
+    if (sbH > 0) {
+        float sy0 = y1 + 1, sy1 = y1 + sbH - 1;
+        dl->AddRectFilled(ImVec2(p0.x, sy0), ImVec2(p0.x + sz.x, sy1), IM_COL32(28, 30, 25, 255), 2);
+        float f0 = g.tlScroll / contentW, f1 = (g.tlScroll + sz.x) / contentW;
+        dl->AddRectFilled(ImVec2(p0.x + f0 * sz.x, sy0), ImVec2(p0.x + f1 * sz.x, sy1),
+                          IM_COL32(120, 170, 40, 255), 2);
+    }
 
-    // interaction
-    ImVec2 mp = ImGui::GetIO().MousePos;
     auto requestAt = [&](double t) {
         if (std::abs(t - g.lastReqT) > 0.001) {
             g.lastReqT = t;
@@ -700,80 +809,222 @@ static void TimelineUI(Clip& c) {
     };
     if (ImGui::IsItemActivated()) {
         g.dragMode = 3;
-        float grab = 8.f * g.dpi;
-        for (size_t i = 0; i + 1 < c.secs.size(); i++) {
-            if (std::abs(mp.x - X(c.secs[i].b)) < grab) { g.dragMode = 100 + (int)i; break; }
+        if (sbH > 0 && mp.y > y1) g.dragMode = 5;
+        if (g.dragMode == 3) {
+            for (size_t mi = 0; mi < c.markers.size(); mi++) {
+                if (std::abs(mp.x - X(c.markers[mi].t)) < 6.f * g.dpi) {
+                    g.dragMode = 1000 + (int)mi;
+                    break;
+                }
+            }
         }
     }
     if (ImGui::IsItemActive()) {
-        double t = T(mp.x);
-        if (g.dragMode >= 100) {
-            size_t i = (size_t)(g.dragMode - 100);
-            if (i + 1 < c.secs.size()) {
-                t = std::clamp(t, c.secs[i].a + 0.05, c.secs[i + 1].b - 0.05);
-                c.secs[i].b = t;
-                c.secs[i + 1].a = t;
+        if (g.dragMode == 5) {
+            g.tlScroll = std::clamp((mp.x - p0.x) / sz.x * contentW - sz.x * 0.5f, 0.f,
+                                    std::max(0.f, contentW - sz.x));
+        } else if (g.dragMode >= 1000) {
+            size_t mi = (size_t)(g.dragMode - 1000);
+            if (mi < c.markers.size()) {
+                c.markers[mi].t = T(mp.x);
+                c.playhead = c.markers[mi].t;
+                requestAt(c.playhead);
             }
+        } else if (g.dragMode == 3) {
+            c.playhead = T(mp.x);
+            requestAt(c.playhead);
         }
-        c.playhead = t;
-        requestAt(t);
     } else if (ImGui::IsItemDeactivated()) {
         g.dragMode = 0;
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-        if (TrimSection* s = SectionAt(c, T(mp.x))) s->keep = !s->keep;
+        for (size_t mi = 0; mi < c.markers.size(); mi++)
+            if (std::abs(mp.x - X(c.markers[mi].t)) < 8.f * g.dpi) {
+                c.markers.erase(c.markers.begin() + mi);
+                break;
+            }
     }
-    if (ImGui::IsItemHovered() && !ImGui::GetIO().WantTextInput &&
-        ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-        AddCutMark(c, T(mp.x));
+    if (ImGui::IsItemHovered() && io.MouseWheel != 0.f) {
+        if (io.KeyCtrl) {
+            double tA = T(mp.x);
+            g.tlZoom = std::clamp(g.tlZoom * (io.MouseWheel > 0 ? 1.3f : 1.f / 1.3f), 1.f, 60.f);
+            contentW = std::max(sz.x * g.tlZoom, sz.x);
+            g.tlScroll = std::clamp((float)(tA / dur) * contentW - (mp.x - p0.x), 0.f,
+                                    std::max(0.f, contentW - sz.x));
+        } else {
+            g.tlScroll = std::clamp(g.tlScroll - io.MouseWheel * 90.f * g.dpi, 0.f,
+                                    std::max(0.f, contentW - sz.x));
+        }
     }
 
-    // labels under the strip
     char lbl[160];
-    snprintf(lbl, sizeof(lbl), "%s  |  %d section(s), keeping %s of this clip",
-             FormatTime(c.playhead).c_str(), (int)c.secs.size(),
-             FormatTime(ClipKeptDuration(c)).c_str());
-    dl->AddText(ImVec2(p0.x + 4, y1 + 2), IM_COL32(216, 226, 205, 255), lbl);
-    std::string durs = FormatTime(dur);
-    ImVec2 ts = ImGui::CalcTextSize(durs.c_str());
-    dl->AddText(ImVec2(p0.x + sz.x - ts.x - 4, y1 + 2), IM_COL32(126, 136, 114, 255), durs.c_str());
+    snprintf(lbl, sizeof(lbl), "%s  |  %d marker(s)", FormatTime(c.playhead).c_str(),
+             (int)c.markers.size());
+    dl->AddText(ImVec2(p0.x + 4, y1 + sbH + 2), IM_COL32(216, 226, 205, 255), lbl);
+    char rl[64];
+    snprintf(rl, sizeof(rl), "%s  |  zoom %.1fx", FormatTime(dur).c_str(), g.tlZoom);
+    ImVec2 ts = ImGui::CalcTextSize(rl);
+    dl->AddText(ImVec2(p0.x + sz.x - ts.x - 4, y1 + sbH + 2), IM_COL32(126, 136, 114, 255), rl);
 }
 
-static void ScreenTrim() {
+// left-column global panel: overview, global media, music + beats
+static void WholeVideoPanel() {
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::Lime);
+    ImGui::SeparatorText("Whole video");
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("The vision: vibe, style, what you want.");
+    InputTextMultilineStr("##overview", g.overview,
+                          ImVec2(-1, ImGui::GetTextLineHeight() * 4.5f));
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Global media (watermark, logo, ads...):");
+    int nGlobal = 0;
+    for (const auto& m : g.media)
+        if (m.kind != "other") nGlobal++;
+    ImGui::Text("%d file(s) in the media library", nGlobal);
+    if (ImGui::Button("Attach media file...", ImVec2(-1, 0))) {
+        std::vector<std::string> paths;
+        if (OpenAnyMediaFilesDialog(g.hwnd, paths))
+            for (const auto& p : paths) ImportIntoMedia(p);
+    }
+    ImGui::SameLine(0, 0);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Copied into the project's media folder and listed in the prompt.\n"
+                          "You can also drop files into the media folder directly.");
+    ImGui::NewLine();
+    if (ImGui::SmallButton("Open media folder")) OpenInExplorer(g.proj.MediaDir());
+
+    // ---- music -----------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::Lime);
+    ImGui::SeparatorText("Music");
+    ImGui::PopStyleColor();
+    ImGui::BeginDisabled(g.tapping);
+    if (g.music.enabled()) {
+        std::string name = g.music.path;
+        size_t slash = name.find_last_of("\\/");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+        if (!g.musicProbed) ImGui::Text("%s (reading...)", name.c_str());
+        else ImGui::Text("%s (%s)", name.c_str(), FormatTime(g.music.duration).c_str());
+        if (ImGui::SmallButton("Change...")) {
+            std::string path;
+            if (OpenAudioFileDialog(g.hwnd, path)) {
+                g.music.path = path;
+                StartProbeMusic();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            g.music.path.clear();
+            g.music.duration = 0;
+            g.musicProbed = true;
+        }
+        float vol = (float)g.music.volume;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##mvol", &vol, 0.02f, 1.0f, "volume %.2f"))
+            g.music.volume = vol;
+        bool loop = g.music.loop;
+        if (ImGui::Checkbox("Loop if shorter", &loop)) g.music.loop = loop;
+    } else {
+        if (ImGui::Button("Choose music file...", ImVec2(-1, 0))) {
+            std::string path;
+            if (OpenAudioFileDialog(g.hwnd, path)) {
+                g.music.path = path;
+                StartProbeMusic();
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (!g.musicMsg.empty()) ImGui::TextColored(theme::Bad, "%s", g.musicMsg.c_str());
+
+    // beat tapping
+    if (g.music.enabled() && g.musicProbed) {
+        if (g.tapping) {
+            double pos = MciPosSec();
+            ImGui::Text("%s / %s", FormatTime(pos < 0 ? 0 : pos).c_str(),
+                        FormatTime(g.music.duration).c_str());
+            ImGui::PushStyleColor(ImGuiCol_Button, theme::Lime);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme::LimeHi);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, theme::LimeDim);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.05f, 0.07f, 0.02f, 1.f));
+            bool tapped = ImGui::Button("TAP (Space)", ImVec2(-1, 44.f * g.dpi));
+            ImGui::PopStyleColor(4);
+            if (!tapped && !ImGui::GetIO().WantTextInput &&
+                ImGui::IsKeyPressed(ImGuiKey_Space, false))
+                tapped = true;
+            if (tapped && pos >= 0) g.tapTimes.push_back(std::max(0.0, pos - 0.06));
+            ImGui::Text("%d taps", (int)g.tapTimes.size());
+            bool finish = false;
+            if (ImGui::SmallButton("Done")) finish = true;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel")) {
+                MciStop();
+                g.tapping = false;
+            }
+            if (pos > 0.3 && !MciPlaying()) finish = true;
+            if (finish && g.tapping) {
+                g.music.beats = g.tapTimes;
+                MciStop();
+                g.tapping = false;
+                SaveMusicFile(g.proj, g.music, nullptr);
+            }
+        } else if (g.tapPreparing) {
+            ImGui::TextColored(theme::Warn, "Preparing audio...");
+        } else {
+            if (!g.music.beats.empty()) {
+                ImGui::Text("%d beats tapped", (int)g.music.beats.size());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear")) {
+                    g.music.beats.clear();
+                    SaveMusicFile(g.proj, g.music, nullptr);
+                }
+            }
+            if (ImGui::Button(g.music.beats.empty() ? "Tap beats..." : "Re-tap beats...",
+                              ImVec2(-1, 0)))
+                StartTapping();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The song plays; press SPACE on every hard beat/drop.\n"
+                                  "The AI sizes its clips so kills land on those beats.");
+        }
+    }
+    bool ab = g.music.autobalance;
+    if (ImGui::Checkbox("Auto-balance final audio", &ab)) g.music.autobalance = ab;
+}
+
+static void ScreenMarkUp() {
     FfmpegBanner();
     float bottomH = ImGui::GetFrameHeightWithSpacing() + 12.f * g.dpi;
 
-    // ---- left: clip list -------------------------------------------------
+    // ---- left: clips + whole-video panel ---------------------------------
     ImGui::BeginChild("##left", ImVec2(300.f * g.dpi, -bottomH));
     ImGui::BeginDisabled(!g.ffprobeOk);
-    if (ImGui::Button("+ Add videos...", ImVec2(-1, 0))) {
+    if (ImGui::Button("+ Add raw videos...", ImVec2(-1, 0))) {
         std::vector<std::string> paths;
         if (OpenVideoFilesDialog(g.hwnd, paths))
             for (const auto& p : paths) AddClipPath(p);
     }
     ImGui::EndDisabled();
-    ImGui::Spacing();
     int removeIdx = -1, moveFrom = -1, moveTo = -1;
     for (int i = 0; i < (int)g.clips.size(); i++) {
         Clip& c = g.clips[i];
         ImGui::PushID((int)c.id);
         bool selected = g.sel == i;
-        std::string label = std::to_string(i + 1) + ". " + c.fileName;
+        std::string label = "src " + std::to_string(i + 1) + ": " + c.fileName;
         if (!c.err.empty()) ImGui::PushStyleColor(ImGuiCol_Text, theme::Bad);
-        if (ImGui::Selectable(label.c_str(), selected,
-                              ImGuiSelectableFlags_AllowOverlap,
+        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_AllowOverlap,
                               ImVec2(214.f * g.dpi, 0))) {
             g.sel = i;
             g.preview = nullptr;
+            g.tlZoom = 1.f;
+            g.tlScroll = 0.f;
             if (c.probed && c.err.empty()) RequestPreview(c, c.playhead);
         }
         if (!c.err.empty()) {
             ImGui::PopStyleColor();
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", c.err.c_str());
-        } else if (c.probed) {
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s\n%dx%d, %s", c.path.c_str(), c.info.w, c.info.h,
-                                  FormatTime(c.info.duration).c_str());
+        } else if (c.probed && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s\n%dx%d @ %.6g fps, %s", c.path.c_str(), c.info.w, c.info.h,
+                              c.info.fps, FormatTime(c.info.duration).c_str());
         }
         ImGui::SameLine(220.f * g.dpi);
         if (ImGui::SmallButton("^") && i > 0) { moveFrom = i; moveTo = i - 1; }
@@ -793,16 +1044,14 @@ static void ScreenTrim() {
         if (g.sel >= (int)g.clips.size()) g.sel = (int)g.clips.size() - 1;
         g.preview = nullptr;
     }
-    if (g.clips.empty()) {
-        ImGui::TextDisabled("Add your raw videos, then cut them\ninto sections on the right.");
-    } else {
-        ImGui::Spacing();
-        ImGui::TextDisabled("Total kept: %s", FormatTime(TotalTrimmedDuration()).c_str());
-    }
+    if (g.clips.empty())
+        ImGui::TextDisabled("Add your raw footage, then drop\nmarkers on the moments that matter.");
+    ImGui::Spacing();
+    WholeVideoPanel();
     ImGui::EndChild();
     ImGui::SameLine();
 
-    // ---- right: preview + timeline --------------------------------------
+    // ---- right: preview + timeline + markers ------------------------------
     ImGui::BeginChild("##right", ImVec2(0, -bottomH));
     if (g.sel >= 0 && g.sel < (int)g.clips.size()) {
         Clip& c = g.clips[g.sel];
@@ -811,10 +1060,11 @@ static void ScreenTrim() {
         } else if (!c.err.empty()) {
             ImGui::TextColored(theme::Bad, "This file can't be used: %s", c.err.c_str());
         } else {
-            float ctrlH = ImGui::GetFrameHeightWithSpacing() * 2 + 10.f * g.dpi;
-            float tlH = 96.f * g.dpi + 8.f * g.dpi;
+            float markersH = 170.f * g.dpi;
+            float ctrlH = ImGui::GetFrameHeightWithSpacing() + 8.f * g.dpi;
+            float tlH = 104.f * g.dpi;
             ImVec2 pv = ImGui::GetContentRegionAvail();
-            pv.y = std::max(80.f, pv.y - tlH - ctrlH);
+            pv.y = std::max(80.f, pv.y - tlH - ctrlH - markersH);
             {
                 ImVec2 box = pv;
                 float aspect = c.info.h > 0 ? (float)c.info.w / c.info.h : 16.f / 9.f;
@@ -834,14 +1084,12 @@ static void ScreenTrim() {
                 ImGui::SetCursorPos(ImVec2(cur.x, cur.y + box.y));
             }
             TimelineUI(c);
-            // controls under the timeline
-            if (ImGui::Button("Cut at playhead (C)")) AddCutMark(c, c.playhead);
-            ImGui::SameLine();
-            if (ImGui::Button("Remove cut at playhead")) RemoveCutNear(c, c.playhead);
-            ImGui::SameLine();
-            if (ImGui::Button("Keep / remove this section")) {
-                if (TrimSection* s = SectionAt(c, c.playhead)) s->keep = !s->keep;
-            }
+            if (!g.hiResDone && NowSeconds() - g.lastReqWall > 0.35)
+                RequestPreview(c, c.playhead, true);
+            if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_M, false))
+                AddMarkerAt(c, c.playhead);
+            // controls
+            if (ImGui::Button("Add marker (M)")) AddMarkerAt(c, c.playhead);
             ImGui::SameLine();
             auto step = [&](double d) {
                 c.playhead = std::clamp(c.playhead + d, 0.0, c.info.duration);
@@ -850,16 +1098,18 @@ static void ScreenTrim() {
             };
             if (ImGui::Button("-1s")) step(-1);
             ImGui::SameLine();
-            if (ImGui::Button("-1f")) step(-1.0 / 30.0);
+            if (ImGui::Button("-1f")) step(-1.0 / std::max(10.0, c.info.fps > 0 ? c.info.fps : 30.0));
             ImGui::SameLine();
-            if (ImGui::Button("+1f")) step(1.0 / 30.0);
+            if (ImGui::Button("+1f")) step(1.0 / std::max(10.0, c.info.fps > 0 ? c.info.fps : 30.0));
             ImGui::SameLine();
             if (ImGui::Button("+1s")) step(1);
             ImGui::SameLine();
-            ImGui::TextDisabled("|");
+            ImGui::BeginDisabled(g.tlZoom <= 1.001f);
+            if (ImGui::Button("Fit")) { g.tlZoom = 1.f; g.tlScroll = 0.f; }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Scrub res:");
+            ImGui::TextUnformatted("Scrub:");
             ImGui::SameLine();
             {
                 static const char* items = "1/1\0" "1/2\0" "1/4\0" "1/8\0" "1/16\0";
@@ -867,265 +1117,85 @@ static void ScreenTrim() {
                 int idx = 1;
                 for (int di = 0; di < 5; di++)
                     if (divs[di] == g.scrubDiv) idx = di;
-                ImGui::SetNextItemWidth(80.f * g.dpi);
+                ImGui::SetNextItemWidth(76.f * g.dpi);
                 if (ImGui::Combo("##scrubres", &idx, items)) {
                     g.scrubDiv = divs[idx];
                     g.lastReqT = c.playhead;
                     RequestPreview(c, c.playhead);
                 }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Preview resolution while scrubbing.\nLower = faster seeking. "
-                                      "Does not affect the final render.");
             }
-            ImGui::TextDisabled("Cut the video into sections, then choose what stays: green bar = kept, "
-                                "red bar = removed. Right-click a section to toggle it. Drag the yellow "
-                                "marks to fine-tune, drag anywhere else to scrub.");
+            // marker list with notes + media attachments
+            ImGui::BeginChild("##markers", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            if (c.markers.empty()) {
+                ImGui::TextDisabled("No markers yet. Scrub to a kill / punchline / moment and press "
+                                    "M. Each marker takes a note and (optionally) an attached media "
+                                    "file - the AI anchors the edit to these.");
+            }
+            int delMk = -1;
+            for (int mi = 0; mi < (int)c.markers.size(); mi++) {
+                auto& mk = c.markers[mi];
+                ImGui::PushID(mi);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(theme::Lime, "@ %s", FormatTime(mk.t).c_str());
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 190.f * g.dpi);
+                InputTextStrHint("##note", "what happens here / what do you want...", mk.note);
+                ImGui::SameLine();
+                if (mk.media.empty()) {
+                    if (ImGui::SmallButton("attach media")) {
+                        std::vector<std::string> paths;
+                        if (OpenAnyMediaFilesDialog(g.hwnd, paths) && !paths.empty()) {
+                            std::string name = ImportIntoMedia(paths[0]);
+                            if (!name.empty()) mk.media = name;
+                        }
+                    }
+                } else {
+                    if (ImGui::SmallButton(("[" + mk.media + "]").c_str())) mk.media.clear();
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("attached - click to detach");
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) delMk = mi;
+                ImGui::PopID();
+            }
+            if (delMk >= 0) c.markers.erase(c.markers.begin() + delMk);
+            ImGui::EndChild();
         }
     } else {
-        ImGui::TextDisabled("Select a clip on the left.");
+        ImGui::TextDisabled("Select a source on the left.");
     }
     ImGui::EndChild();
 
     std::string why;
-    bool ready = AllClipsReady(&why) && g.ffmpegOk;
-    if (ready && TotalTrimmedDuration() < 0.1) { ready = false; why = "everything is marked removed"; }
-    if (!g.ffmpegOk && why.empty()) why = "FFmpeg is required";
-    if (BottomBar("Next: mark up >", ready, why.c_str())) {
+    bool ready = !g.clips.empty() && g.ffmpegOk && !g.tapping && !g.tapPreparing;
+    for (const auto& c : g.clips) {
+        if (!c.probed) { ready = false; why = "still reading video info..."; }
+        else if (!c.err.empty()) { ready = false; why = "remove sources marked red first"; }
+    }
+    if (g.clips.empty()) why = "add at least one video";
+    else if (!g.ffmpegOk && why.empty()) why = "FFmpeg is required";
+    else if ((g.tapping || g.tapPreparing) && why.empty()) why = "finish beat tapping first";
+    if (BottomBar("Next: generate prompt >", ready, why.c_str())) {
         SaveTrimNow();
-        g.screen = Screen::MarkUp;
-    }
-    if (!g.trimMsg.empty()) ImGui::TextColored(theme::Bad, "%s", g.trimMsg.c_str());
-}
-
-static void ScreenMarkUp() {
-    FfmpegBanner();
-    float bottomH = ImGui::GetFrameHeightWithSpacing() + 12.f * g.dpi;
-
-    ImGui::TextWrapped("Describe each kept section (what happens in it, what you want done with it) "
-                       "and each transition between sections. Everything you write here is handed "
-                       "to the AI as instructions. You can leave fields empty.");
-    ImGui::Spacing();
-
-    ImGui::BeginChild("##markup", ImVec2(0, -bottomH));
-    int segNo = 0;
-    TrimSection* prev = nullptr;
-    for (auto& c : g.clips) {
-        if (!c.probed || !c.err.empty()) continue;
-        double dur = c.info.duration;
-        for (auto& s : c.secs) {
-            if (!s.keep) continue;
-            segNo++;
-            ImGui::PushID((void*)&s);
-            if (prev) {
-                ImGui::Indent(46.f * g.dpi);
-                ImGui::AlignTextToFramePadding();
-                ImGui::TextColored(theme::LimeHi, "transition %d -> %d",
-                                   segNo - 1, segNo);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(-20.f * g.dpi);
-                InputTextStrHint("##trans",
-                                 "e.g. hard cut is fine / add a whoosh sound / flash a title here...",
-                                 prev->trans);
-                ImGui::Unindent(46.f * g.dpi);
-                ImGui::Spacing();
-            }
-            // thumbnail from the filmstrip nearest to the section middle
-            TexPtr th;
-            if (dur > 0 && !c.strip.empty()) {
-                int idx = std::clamp((int)(((s.a + s.b) * 0.5 / dur) * kStripCount), 0,
-                                     (int)c.strip.size() - 1);
-                th = c.strip[idx];
-            }
-            ImVec2 tsz(88.f * g.dpi, 50.f * g.dpi);
-            if (th) ImGui::Image((ImTextureID)th->ImId(), tsz);
-            else ImGui::Dummy(tsz);
-            ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::Text("Section %d  -  %s  [%s .. %s]  (%s)", segNo, c.fileName.c_str(),
-                        FormatTime(s.a).c_str(), FormatTime(s.b).c_str(),
-                        FormatTime(s.b - s.a).c_str());
-            ImGui::SetNextItemWidth(-20.f * g.dpi);
-            InputTextStrHint("##note",
-                             "what is this section / what should the AI do with it...",
-                             s.note);
-            ImGui::EndGroup();
-            ImGui::Spacing();
-            ImGui::Spacing();
-            ImGui::PopID();
-            prev = &s;
-        }
-    }
-    if (segNo == 0)
-        ImGui::TextColored(theme::Bad,
-                           "No kept sections. Go back to Trim and keep at least one section.");
-    ImGui::EndChild();
-
-    if (BottomBar("Next: add media >", segNo > 0, segNo == 0 ? "nothing is kept" : "")) {
-        SaveTrimNow();
-        std::error_code ec;
-        fs::create_directories(fs::path(Utf8ToWide(g.proj.MediaDir())), ec);
-        RescanMedia(true);
-        OpenInExplorer(g.proj.MediaDir());
-        g.screen = Screen::Media;
-    }
-}
-
-static void ScreenMedia() {
-    FfmpegBanner();
-    RescanMedia(false);
-    float bottomH = ImGui::GetFrameHeightWithSpacing() + 12.f * g.dpi;
-
-    ImGui::TextWrapped("Your trim was saved to \"%s\". Now drop any extra media the AI may use "
-                       "(images, sound effects, music) into the media folder below. "
-                       "This window refreshes automatically.",
-                       g.proj.TrimFilePath().c_str());
-    ImGui::Spacing();
-    ImGui::TextUnformatted(g.proj.MediaDir().c_str());
-    ImGui::SameLine();
-    if (ImGui::Button("Open media folder")) OpenInExplorer(g.proj.MediaDir());
-    ImGui::Spacing();
-
-    ImGui::BeginChild("##mediatable", ImVec2(0, -bottomH));
-    if (g.media.empty()) {
-        ImGui::TextDisabled("No media yet. That's OK - the AI can still cut, speed up and add text.");
-    } else if (ImGui::BeginTable("media", 4,
-                                 ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH)) {
-        ImGui::TableSetupColumn("File");
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 70.f * g.dpi);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90.f * g.dpi);
-        ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthFixed, 170.f * g.dpi);
-        ImGui::TableHeadersRow();
-        for (const auto& m : g.media) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(m.name.c_str());
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(m.kind.c_str());
-            ImGui::TableNextColumn();
-            ImGui::Text("%.1f KB", m.sizeBytes / 1024.0);
-            ImGui::TableNextColumn();
-            if (!m.probed) ImGui::TextDisabled("...");
-            else if (m.kind == "image") ImGui::Text("%dx%d px", m.info.w, m.info.h);
-            else if (m.kind == "audio" || m.kind == "video")
-                ImGui::TextUnformatted(FormatTime(m.info.duration).c_str());
-            else ImGui::TextDisabled("unsupported");
-        }
-        ImGui::EndTable();
-    }
-    ImGui::EndChild();
-
-    bool probing = false;
-    for (const auto& m : g.media)
-        if (!m.probed && g.ffprobeOk && m.kind != "other") probing = true;
-    if (BottomBar("Next: music >", !probing, probing ? "measuring media files..." : "")) {
-        g.screen = Screen::Music;
-    }
-}
-
-static void StartProbeMusic() {
-    g.musicProbed = false;
-    g.musicMsg.clear();
-    std::string path = g.music.path;
-    JobsPush([path]() {
-        MediaInfo mi = ProbeMedia(path);
-        PostToMainThread([path, mi]() {
-            if (g.music.path != path) return;   // changed meanwhile
-            g.musicProbed = true;
-            if (!mi.ok || !mi.hasAudio) {
-                g.musicMsg = "This file has no usable audio: " +
-                             (mi.error.empty() ? path : mi.error);
-                g.music.path.clear();
-            } else {
-                g.music.duration = mi.duration;
-            }
-        });
-    });
-}
-
-static void ScreenMusic() {
-    FfmpegBanner();
-    float bottomH = ImGui::GetFrameHeightWithSpacing() + 12.f * g.dpi;
-
-    ImGui::TextWrapped("Optional: pick one music track to lay under the whole video. "
-                       "The AI is told about it so it won't add its own music. "
-                       "The track is trimmed to the video length and faded out at the end.");
-    ImGui::Spacing();
-
-    ImGui::BeginChild("##musicbody", ImVec2(0, -bottomH));
-    if (g.music.enabled()) {
-        std::string name = g.music.path;
-        size_t slash = name.find_last_of("\\/");
-        if (slash != std::string::npos) name = name.substr(slash + 1);
-        if (!g.musicProbed)
-            ImGui::Text("%s  (reading...)", name.c_str());
-        else
-            ImGui::Text("%s  (%s)", name.c_str(), FormatTime(g.music.duration).c_str());
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g.music.path.c_str());
-        if (ImGui::Button("Change...")) {
-            std::string path;
-            if (OpenAudioFileDialog(g.hwnd, path)) {
-                g.music.path = path;
-                StartProbeMusic();
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Remove music")) {
-            g.music.path.clear();
-            g.music.duration = 0;
-            g.musicProbed = true;
-        }
-        ImGui::Spacing();
-        float vol = (float)g.music.volume;
-        ImGui::SetNextItemWidth(320.f * g.dpi);
-        if (ImGui::SliderFloat("Music volume", &vol, 0.02f, 1.0f, "%.2f"))
-            g.music.volume = vol;
-        bool loop = g.music.loop;
-        if (ImGui::Checkbox("Loop if shorter than the video", &loop)) g.music.loop = loop;
-    } else {
-        if (ImGui::Button("Choose music file...", ImVec2(240.f * g.dpi, 0))) {
-            std::string path;
-            if (OpenAudioFileDialog(g.hwnd, path)) {
-                g.music.path = path;
-                StartProbeMusic();
-            }
-        }
-        ImGui::TextDisabled("No music selected - that's fine, you can skip this step.");
-    }
-    if (!g.musicMsg.empty())
-        ImGui::TextColored(theme::Bad, "%s", g.musicMsg.c_str());
-
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, theme::Lime);
-    ImGui::SeparatorText("Audio balancing");
-    ImGui::PopStyleColor();
-    bool ab = g.music.autobalance;
-    if (ImGui::Checkbox("Auto-balance the final mix (loudness normalization)", &ab))
-        g.music.autobalance = ab;
-    ImGui::TextDisabled("Evens out music, sound effects and the original audio so nothing\n"
-                        "blows out or disappears. Applies whenever audio is mixed.");
-    ImGui::EndChild();
-
-    bool ready = g.musicProbed;
-    if (BottomBar("Next: generate prompt >", ready, ready ? "" : "reading music file...")) {
-        std::string err;
-        SaveMusicFile(g.proj, g.music, &err);
+        SaveMusicFile(g.proj, g.music, nullptr);
         GeneratePromptNow();
         g.screen = Screen::Prompt;
     }
+    if (!g.trimMsg.empty()) ImGui::TextColored(theme::Bad, "%s", g.trimMsg.c_str());
 }
 
 static void ScreenPrompt() {
     float bottomH = ImGui::GetFrameHeightWithSpacing() + 12.f * g.dpi;
     ImGui::TextWrapped("%s", g.promptMsg.empty() ? "Prompt ready." : g.promptMsg.c_str());
-    ImGui::TextWrapped("Paste it into ChatGPT / Claude / your AI of choice. It will reply with a "
-                       ".edit file - copy that reply and continue to the next step.");
+    ImGui::TextWrapped("Paste it into ChatGPT / Claude / your AI of choice. It replies with an "
+                       "AIVE_SCRIPT program - copy that reply, then click Next: if a valid "
+                       "script is on your clipboard the render starts automatically.");
     ImGui::Spacing();
     if (ImGui::Button("Copy prompt again")) {
         ImGui::SetClipboardText(g.promptText.c_str());
         g.promptMsg = "Copied to clipboard again.";
     }
     ImGui::SameLine();
-    if (ImGui::Button("Regenerate (rescan media)")) GeneratePromptNow();
+    if (ImGui::Button("Regenerate")) GeneratePromptNow();
     ImGui::SameLine();
     if (ImGui::Button("Open project folder")) OpenInExplorer(g.proj.dir);
     ImGui::Spacing();
@@ -1133,8 +1203,21 @@ static void ScreenPrompt() {
     ImGui::TextUnformatted(g.promptText.c_str());
     ImGui::EndChild();
 
-    if (BottomBar("Next: paste the .edit >", !g.promptText.empty(), "")) {
-        EnterEditScreenLoadingMedia();
+    if (BottomBar("Next: edit + render >", !g.promptText.empty(), "")) {
+        g.screen = Screen::Edit;
+        // auto-paste + validate + render straight from the clipboard
+        const char* cb = ImGui::GetClipboardText();
+        if (cb && *cb && LooksLikeEditReply(cb)) {
+            g.editText = cb;
+            g.lastAutoPasted = cb;
+            ValidateEditNow();
+            if (g.script.Valid() && g.ffmpegOk && !g.render.running) {
+                StartRenderNow();
+                g.editMsg = "Found a valid script on your clipboard - rendering now.";
+            } else {
+                g.editMsg = "Pasted the script from your clipboard.";
+            }
+        }
     }
 }
 
@@ -1143,7 +1226,27 @@ static void ScreenEdit() {
     bool rendering = g.render.running;
     bool renderDone = g.render.done;
 
-    ImGui::TextWrapped("Paste the .edit file your AI replied with, validate it, then render.");
+    // clipboard watcher: an AI reply starting with !!! pastes + validates itself
+    if (!rendering) {
+        double now = NowSeconds();
+        if (now - g.lastClipCheck > 0.5) {
+            g.lastClipCheck = now;
+            const char* cb = ImGui::GetClipboardText();
+            if (cb && *cb) {
+                std::string s = cb;
+                if (s != g.lastAutoPasted && s != g.editText && LooksLikeEditReply(s)) {
+                    g.lastAutoPasted = s;
+                    g.editText = s;
+                    ValidateEditNow();
+                    g.editMsg = "Detected a script on your clipboard - pasted and validated it.";
+                }
+            }
+        }
+    }
+
+    ImGui::TextWrapped("Paste the AI's script, validate it, then render. (Copying the reply is "
+                       "enough - it's detected and pasted automatically.)");
+    if (!g.editMsg.empty()) ImGui::TextColored(theme::LimeHi, "%s", g.editMsg.c_str());
     ImGui::Spacing();
 
     float logH = 0;
@@ -1153,41 +1256,93 @@ static void ScreenEdit() {
     ImGui::BeginDisabled(rendering);
     if (ImGui::Button("Paste from clipboard")) {
         const char* t = ImGui::GetClipboardText();
-        if (t) { g.editText = t; g.validated = false; }
+        if (t) {
+            g.editText = t;
+            g.lastAutoPasted = t;
+            ValidateEditNow();
+        }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Validate")) {
-        RescanMedia(true);
-        g.script = ParseEdit(g.editText, TotalTrimmedDuration(), g.media);
-        g.validated = true;
-        std::string err;
-        WriteTextFile(g.proj.EditFilePath(), g.editText, &err);
-    }
+    if (ImGui::Button("Validate")) ValidateEditNow();
     ImGui::SameLine();
-    ImGui::TextDisabled("base duration: %s", FormatTime(TotalTrimmedDuration()).c_str());
+    ImGui::TextDisabled("raw footage: %s", FormatTime(TotalSourceDuration()).c_str());
 
     float editorH = ImGui::GetContentRegionAvail().y - bottomH;
     float msgH = 0;
-    if (g.validated) msgH = 96.f * g.dpi;
+    if (g.validated) {
+        msgH = 120.f * g.dpi;
+        if (!g.script.questions.empty())
+            msgH += (float)g.script.questions.size() * 58.f * g.dpi + 66.f * g.dpi;
+        msgH = std::min(msgH, editorH * 0.6f);
+    }
     if (InputTextMultilineStr("##edit", g.editText, ImVec2(-1, std::max(60.f, editorH - msgH))))
         g.validated = false;
     if (g.validated) {
         ImGui::BeginChild("##valmsg", ImVec2(0, msgH), ImGuiChildFlags_Borders);
-        if (!g.script.errors.empty()) {
-            for (const auto& e : g.script.errors)
-                ImGui::TextColored(theme::Bad, "%s", e.c_str());
-        } else {
-            ImGui::TextColored(theme::LimeHi,
-                               "Valid: %d operation(s). Final video will be about %s long.",
-                               (int)g.script.ops.size(), FormatTime(g.script.finalDur).c_str());
+        // one-click copy of the whole validation report (AI-ready when broken)
+        {
+            char sum[160];
+            std::snprintf(sum, sizeof(sum), "Valid: %d timeline clip(s), %d op(s). Final video ~%s.",
+                          (int)g.script.timeline.size(), (int)g.script.ops.size(),
+                          FormatTime(g.script.finalDur).c_str());
+            if (ImGui::SmallButton(g.script.errors.empty() ? "Copy report"
+                                                           : "Copy errors for the AI")) {
+                std::string rep;
+                if (g.script.errors.empty()) {
+                    rep = sum;
+                    for (const auto& w : g.script.warnings) rep += "\nwarning: " + w;
+                } else {
+                    rep = "The AIVE_SCRIPT validator rejected the script:\n";
+                    for (const auto& e : g.script.errors) rep += "- " + e + "\n";
+                    for (const auto& w : g.script.warnings) rep += "- warning: " + w + "\n";
+                    rep += "\nReply with ONLY the corrected full script in one code block "
+                           "starting with !!!.";
+                }
+                ImGui::SetClipboardText(rep.c_str());
+            }
+            ImGui::SameLine();
+            if (!g.script.errors.empty()) {
+                ImGui::TextColored(theme::Bad, "%d error(s):", (int)g.script.errors.size());
+            } else {
+                ImGui::TextColored(theme::LimeHi, "%s", sum);
+            }
         }
+        for (const auto& e : g.script.errors)
+            ImGui::TextColored(theme::Bad, "%s", e.c_str());
         for (const auto& w : g.script.warnings)
             ImGui::TextColored(theme::Warn, "warning: %s", w.c_str());
+        if (!g.script.questions.empty()) {
+            ImGui::Separator();
+            ImGui::TextColored(theme::Warn,
+                               "The AI asked %d critical question(s). Answer below, send the answers "
+                               "back, then paste its revised script:",
+                               (int)g.script.questions.size());
+            for (int i = 0; i < (int)g.script.questions.size(); i++) {
+                ImGui::PushID(i);
+                ImGui::TextWrapped("Q%d: %s", i + 1, g.script.questions[i].c_str());
+                ImGui::SetNextItemWidth(-20.f * g.dpi);
+                if (i < (int)g.qAnswers.size())
+                    InputTextStrHint("##ans", "your answer...", g.qAnswers[i]);
+                ImGui::PopID();
+            }
+            if (ImGui::Button("Copy answers for the AI")) {
+                std::string reply = "Answers to your questions about the script:\n";
+                for (int i = 0; i < (int)g.script.questions.size(); i++) {
+                    reply += "Q" + std::to_string(i + 1) + ": " + g.script.questions[i] + "\n";
+                    std::string a = i < (int)g.qAnswers.size() ? g.qAnswers[i] : "";
+                    reply += "A" + std::to_string(i + 1) + ": " +
+                             (a.empty() ? "(no answer - use your best judgment)" : a) + "\n";
+                }
+                reply += "\nNow reply with ONLY the corrected, final script in one code block.";
+                ImGui::SetClipboardText(reply.c_str());
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("paste into the same AI chat, then paste the new script here");
+        }
         ImGui::EndChild();
     }
     ImGui::EndDisabled();
 
-    // ---- render status ----------------------------------------------------
     if (rendering || renderDone) {
         std::string stage, error;
         {
@@ -1197,20 +1352,45 @@ static void ScreenEdit() {
         }
         ImGui::Spacing();
         if (rendering) {
-            ImGui::ProgressBar(g.render.progress, ImVec2(-120.f * g.dpi, 0), stage.c_str());
+            char overlay[256];
+            long long fr = g.render.frame.load();
+            double os = g.render.outSec.load();
+            if (fr > 0)
+                std::snprintf(overlay, sizeof(overlay), "%s  |  frame %lld  (%s out)",
+                              stage.c_str(), fr, FormatTime(os).c_str());
+            else
+                std::snprintf(overlay, sizeof(overlay), "%s", stage.c_str());
+            ImGui::ProgressBar(g.render.progress, ImVec2(-120.f * g.dpi, 0), overlay);
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(100.f * g.dpi, 0))) CancelRender(g.render);
         } else if (g.render.success) {
-            ImGui::TextColored(theme::LimeHi, "Render complete: %s",
-                               g.proj.OutputPath().c_str());
+            ImGui::TextColored(theme::LimeHi, "Render complete: %s", g.proj.OutputPath().c_str());
             if (ImGui::Button("Play video")) ShellOpen(g.proj.OutputPath());
             ImGui::SameLine();
             if (ImGui::Button("Open folder")) OpenInExplorer(g.proj.dir);
         } else {
             ImGui::TextColored(theme::Bad, "Render failed.");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy error for the AI")) {
+                std::string rep = "The render failed with this FFmpeg error:\n" + error;
+                {
+                    std::lock_guard<std::mutex> lk(g.render.m);
+                    std::string tail = g.render.log.size() > 2500
+                                           ? g.render.log.substr(g.render.log.size() - 2500)
+                                           : g.render.log;
+                    rep += "\n\nLog tail:\n" + tail;
+                }
+                rep += "\n\nReply with ONLY the corrected full script in one code block "
+                       "starting with !!!.";
+                ImGui::SetClipboardText(rep.c_str());
+            }
             ImGui::TextWrapped("%s", error.c_str());
         }
         if (ImGui::CollapsingHeader("FFmpeg log")) {
+            if (ImGui::SmallButton("Copy full log")) {
+                std::lock_guard<std::mutex> lk(g.render.m);
+                ImGui::SetClipboardText(g.render.log.c_str());
+            }
             ImGui::BeginChild("##fflog", ImVec2(0, 110.f * g.dpi), ImGuiChildFlags_Borders);
             std::lock_guard<std::mutex> lk(g.render.m);
             ImGui::TextUnformatted(g.render.log.c_str());
@@ -1225,11 +1405,7 @@ static void ScreenEdit() {
     else if (rendering) why = "rendering...";
     else if (!g.validated) why = "click Validate first";
     else if (!g.script.Valid()) why = "fix the errors above";
-    if (BottomBar("Render final video", canRender, why)) {
-        std::string err;
-        WriteTextFile(g.proj.EditFilePath(), g.editText, &err);
-        StartRender(g.render, g.proj, FlatKeptSegments(), g.script, g.media, g.music);
-    }
+    if (BottomBar("Render final video", canRender, why)) StartRenderNow();
 }
 
 // ---------------------------------------------------------------- header / shell
@@ -1242,14 +1418,11 @@ static void Header() {
     ImGui::SameLine(0, 24.f * g.dpi);
     struct Step { const char* label; Screen s; };
     const Step steps[] = {
-        { "1. Trim", Screen::Trim },
-        { "2. Mark up", Screen::MarkUp },
-        { "3. Media", Screen::Media },
-        { "4. Music", Screen::Music },
-        { "5. Prompt", Screen::Prompt },
-        { "6. Edit + Render", Screen::Edit },
+        { "1. Mark up", Screen::MarkUp },
+        { "2. Prompt", Screen::Prompt },
+        { "3. Edit + Render", Screen::Edit },
     };
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 3; i++) {
         if (i) { ImGui::SameLine(); ImGui::TextDisabled(">"); ImGui::SameLine(); }
         bool current = g.screen == steps[i].s;
         bool reachable = (int)steps[i].s <= (int)g.screen && !g.render.running;
@@ -1263,8 +1436,11 @@ static void Header() {
         } else {
             ImGui::BeginDisabled(!reachable);
             if (ImGui::Button(steps[i].label)) {
-                if (g.screen == Screen::Trim || g.screen == Screen::MarkUp) SaveTrimNow();
-                if (g.screen == Screen::Music) SaveMusicFile(g.proj, g.music, nullptr);
+                if (g.screen == Screen::MarkUp) {
+                    if (g.tapping) { MciStop(); g.tapping = false; }
+                    SaveTrimNow();
+                    SaveMusicFile(g.proj, g.music, nullptr);
+                }
                 g.screen = steps[i].s;
             }
             ImGui::EndDisabled();
@@ -1275,7 +1451,8 @@ static void Header() {
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.f, ImGui::GetContentRegionAvail().x - w));
     ImGui::BeginDisabled(g.render.running);
     if (ImGui::Button("Close project", ImVec2(w, 0))) {
-        if (g.screen == Screen::Trim || g.screen == Screen::MarkUp) SaveTrimNow();
+        if (g.screen == Screen::MarkUp) SaveTrimNow();
+        if (g.tapping) { MciStop(); g.tapping = false; }
         g.hasProject = false;
         g.screen = Screen::Project;
     }
@@ -1308,10 +1485,7 @@ void AppFrame() {
     Header();
     switch (g.screen) {
     case Screen::Project: ScreenProject(); break;
-    case Screen::Trim:    ScreenTrim(); break;
     case Screen::MarkUp:  ScreenMarkUp(); break;
-    case Screen::Media:   ScreenMedia(); break;
-    case Screen::Music:   ScreenMusic(); break;
     case Screen::Prompt:  ScreenPrompt(); break;
     case Screen::Edit:    ScreenEdit(); break;
     }
@@ -1319,8 +1493,11 @@ void AppFrame() {
 }
 
 void AppShutdown() {
-    if (g.hasProject && (g.screen == Screen::Trim || g.screen == Screen::MarkUp))
+    MciStop();
+    if (g.hasProject && g.screen == Screen::MarkUp) {
         SaveTrimNow();
+        SaveMusicFile(g.proj, g.music, nullptr);
+    }
     ShutdownRender(g.render);
     {
         std::lock_guard<std::mutex> lk(pvM);
