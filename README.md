@@ -1,7 +1,4 @@
-`
-⚠️ PERSONAL MESSAGE FROM MATT: I wrote this whole hog with Claude (fable 5), I made this tool out of necessity and only am putting it on GitHub for other people to use it if they have the same needs - quick simply edited videos for completely free. I plan on building on this in the future because it's at a pretty bare bones level right now, and I'll need more features over time and it's like 3 command prompt commands to update it for you guys so I will.
-`
-
+> ⚠️ **PERSONAL MESSAGE FROM MATT:** I wrote this whole hog with Claude (Fable 5). I made this tool out of necessity and I'm only putting it on GitHub in case other people have the same needs — quick, simple video edits, for free. It's pretty bare-bones right now; I plan on building on this over time, and updating it is like 3 command-prompt commands, so I will.
 
 # AI Video Editor
 
